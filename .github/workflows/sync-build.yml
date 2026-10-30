@@ -73,6 +73,16 @@ jobs:
           git clone --depth 1 --branch ${{ env.UPSTREAM_BRANCH }} https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
           echo "upstream HEAD: $(git -C upstream rev-parse HEAD)"
 
+      # 版本号必须是上游 parseVersion 认得的四段式 年.月.日.HHMM，否则面板一律判「有更新」。
+      # 用上游 HEAD 的提交时间（上海时区）生成，保证与 upstream Release tag 同构且不落后。
+      - name: 计算 APP_VERSION
+        id: ver
+        run: |
+          TS=$(git -C upstream log -1 --format=%cI)
+          VER=$(TZ=Asia/Shanghai date -d "$TS" +%Y.%-m.%-d.%-H%M)
+          echo "value=$VER" >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION=$VER  (from upstream commit time $TS)"
+
       # 先算推送目标：Docker Hub 凭据没配时只推 GHCR，避免登录失败把构建拖垮
       - name: 组装推送目标
         id: tags
@@ -116,7 +126,7 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
-            APP_VERSION=${{ steps.tags.outputs.version }}
+            APP_VERSION=${{ steps.ver.outputs.value }}
           tags: ${{ steps.tags.outputs.value }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
