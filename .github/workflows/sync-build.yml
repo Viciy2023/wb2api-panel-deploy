@@ -12,6 +12,11 @@ on:
     # 每 4 小时一次；UTC 00/04/08/12/16/20 = 北京 08/12/16/20/00/04 点
     - cron: '0 0,4,8,12,16,20 * * *'
   workflow_dispatch:
+    inputs:
+      force:
+        description: "上游 SHA 未变化也强制重建（补推 Docker Hub 时用）"
+        type: boolean
+        default: false
 
 env:
   UPSTREAM_REPO: misakano7545/workbuddy2api-panel
@@ -42,7 +47,7 @@ jobs:
           LAST_LINE=$(cat last-build.txt 2>/dev/null | tr -d '[:space:]' || echo "")
           WANT_FP="${UPSTREAM_SHA}${BUILD_REV}"
           echo "want_fp=$WANT_FP  last_fp=$LAST_LINE"
-          if [ "$WANT_FP" = "$LAST_LINE" ]; then
+          if [ "$WANT_FP" = "$LAST_LINE" ] && [ "${{ inputs.force }}" != "true" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "No change detected (upstream ${UPSTREAM_SHA} + ${BUILD_REV}), skipping build."
           else
