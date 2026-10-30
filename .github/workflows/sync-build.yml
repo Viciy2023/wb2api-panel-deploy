@@ -1,0 +1,134 @@
+name: Sync & Build wb2api-panel
+
+# 从上游 clone 源码后自己构建并推送两个 registry：
+#   ghcr.io/viciy2023/wb2api-panel-deploy  —— GHCR 备用通道
+#   <DOCKERHUB_USERNAME>/wb2api-panel      —— Docker Hub，飞牛实际拉取的那条
+#
+# 与 wb2panel-deploy 的区别：上游换成仍在维护的 misakano7545/workbuddy2api-panel，
+# 镜像/容器名改为 wb2api-panel，只构建 linux/amd64（飞牛是 x86_64）。
+
+on:
+  schedule:
+    # 每 4 小时一次；UTC 00/04/08/12/16/20 = 北京 08/12/16/20/00/04 点
+    - cron: '0 0,4,8,12,16,20 * * *'
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: misakano7545/workbuddy2api-panel
+  UPSTREAM_BRANCH: main
+  IMAGE_NAME: ghcr.io/viciy2023/wb2api-panel-deploy
+  # Docker Hub 仓库名，完整镜像为 <DOCKERHUB_USERNAME>/wb2api-panel
+  DOCKERHUB_REPO: wb2api-panel
+  # 构建产物指纹版本号：改了 Dockerfile 挂载/配置策略就 +1，强制重建一次
+  BUILD_REV: v1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+
+      - name: Get upstream latest SHA
+        id: compare
+        run: |
+          UPSTREAM_SHA=$(gh api repos/${{ env.UPSTREAM_REPO }}/commits/${{ env.UPSTREAM_BRANCH }} --jq '.sha')
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          LAST_LINE=$(cat last-build.txt 2>/dev/null | tr -d '[:space:]' || echo "")
+          WANT_FP="${UPSTREAM_SHA}${BUILD_REV}"
+          echo "want_fp=$WANT_FP  last_fp=$LAST_LINE"
+          if [ "$WANT_FP" = "$LAST_LINE" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No change detected (upstream ${UPSTREAM_SHA} + ${BUILD_REV}), skipping build."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Change detected: ${LAST_LINE:-<empty>} -> $WANT_FP"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+
+      - name: Clone upstream source
+        run: |
+          git clone --depth 1 --branch ${{ env.UPSTREAM_BRANCH }} https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
+          echo "upstream HEAD: $(git -C upstream rev-parse HEAD)"
+
+      # 先算推送目标：Docker Hub 凭据没配时只推 GHCR，避免登录失败把构建拖垮
+      - name: 组装推送目标
+        id: tags
+        run: |
+          SHA="${{ needs.check.outputs.upstream_sha }}"
+          SHORT="${SHA:0:12}"
+          TAGS="${IMAGE_NAME}:latest,${IMAGE_NAME}:${SHORT}"
+          if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ] && [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            DEST="docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${DOCKERHUB_REPO}"
+            TAGS="${TAGS},${DEST}:latest,${DEST}:${SHORT}"
+            echo "hub=true" >> "$GITHUB_OUTPUT"
+            echo "Docker Hub 凭据已配置，将同时推送 ${DEST}。"
+          else
+            echo "hub=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 Docker Hub 凭据，本次只推送 GHCR。"
+          fi
+          echo "value=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "version=${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: steps.tags.outputs.hub == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            APP_VERSION=${{ steps.tags.outputs.version }}
+          tags: ${{ steps.tags.outputs.value }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+
+      - name: Record built fingerprint
+        run: |
+          echo "${{ needs.check.outputs.upstream_sha }}${BUILD_REV}" > last-build.txt
+
+      - name: Commit last-build.txt
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last-build.txt
+          if git diff --staged --quiet; then
+            echo "No change to commit."
+          else
+            git commit -m "build: ${{ needs.check.outputs.upstream_sha }} ${BUILD_REV}"
+            git pull --rebase origin main
+            git push
+          fi
